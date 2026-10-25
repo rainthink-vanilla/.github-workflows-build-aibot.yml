@@ -6,6 +6,7 @@ import io.github.zoyluo.aibot.log.BotLog;
 import io.github.zoyluo.aibot.log.LogFields;
 import io.github.zoyluo.aibot.memory.BotMemoryStore;
 import io.github.zoyluo.aibot.network.FakeClientConnection;
+import io.github.zoyluo.aibot.network.payload.BotReviveS2C;
 import io.github.zoyluo.aibot.mode.CapabilityRuntime;
 import io.github.zoyluo.aibot.mode.PrivilegedCapability;
 import io.github.zoyluo.aibot.pathfinding.Standability;
@@ -19,7 +20,9 @@ import net.minecraft.network.DisconnectionInfo;
 import net.minecraft.network.NetworkSide;
 import net.minecraft.network.packet.c2s.common.SyncedClientOptions;
 import net.minecraft.server.MinecraftServer;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.network.ConnectedClientData;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.registry.RegistryKey;
@@ -83,43 +86,32 @@ public final class AIPlayerManager {
                     bot.getGameProfile().getName());
             respawnStrategy = "strict_world_spawn";
         }
-        // ===== FIX 2026-10-25：死亡后客户端动画抽搐 =====
-        // AIPlayerEntity 继承 ServerPlayerEntity，而玩家血量不会进数据追踪器：
-        // 死亡时客户端只收到 EntityStatusS2CPacket(3)，它把自己的 deathTime 顶到最大并一直躺在
-        // 死亡姿势里；复活时服务端只改了本地副本（setHealth(=20)/deathTime(=0)），
-        // 客户端收不到任何"血量恢复"的包 → 表现就是"已经复活、有血条能被伤害，但动画在抽搐"。
-        //
-        // 修法：不原地复活，改成「销毁旧实体 + 在新位置重新生成」。
-        // 客户端会收到 destroy 再收到 spawn，实体对象整个重建，动画状态自然归零
-        // （等价于手动 /aibot despawn + /aibot spawn，那条路已验证可用）。
-        final MinecraftServer respawnServer = bot.getServer();
-        final String botName = bot.getGameProfile().getName();
-        final String previousRole = role(bot);
-        final java.util.UUID previousOwner = botOwners.get(bot.getUuid());
-        final float previousYaw = bot.getYaw();
-        final float previousPitch = bot.getPitch();
-        final GameMode previousGameMode = bot.interactionManager.getGameMode();
-
-        if (!despawn(respawnServer, botName)) {
-            BotLog.warn(io.github.zoyluo.aibot.log.LogCategory.LIFECYCLE, null,
-                    "bot_respawn_despawn_failed", "name", botName);
-            return false;
+        bot.setHealth(20.0F);
+        bot.deathTime = 0;
+        bot.getHungerManager().setFoodLevel(20);
+        bot.teleport(respawnWorld, respawnPos.x, respawnPos.y, respawnPos.z,
+                Collections.emptySet(), bot.getYaw(), bot.getPitch(), true);
+        bot.extinguish();
+        // FIX 2026-10-25：客户端动画抽搐。
+        // AIPlayerEntity 是 ServerPlayerEntity，玩家血量不走数据追踪器：
+        // 死亡时客户端只收到 EntityStatusS2CPacket(3)，把自己的 deathTime 顶到最大值；
+        // 上面这些 setHealth/deathTime=0 只改了服务端副本，客户端什么包都收不到，
+        // 于是它一直按"死亡姿势 + 最大 deathTime"渲染 —— 看起来就是躺尸抽搐。
+        // 这里补发一条自定义包，让客户端把血量、deathTime、受击状态一起复位。
+        // （不重建实体，所以不会出现"消失再出现"的退出重进观感。）
+        BotReviveS2C revive = new BotReviveS2C(bot.getId(), bot.getMaxHealth());
+        for (ServerPlayerEntity viewer : respawnWorld.getPlayers()) {
+            if (viewer == bot) {
+                continue;
+            }
+            if (ServerPlayNetworking.canSend(viewer, BotReviveS2C.ID)) {
+                ServerPlayNetworking.send(viewer, revive);
+            }
         }
-        java.util.Optional<AIPlayerEntity> recreated = spawn(respawnServer, botName, respawnWorld,
-                respawnPos, previousYaw, previousPitch, previousGameMode, previousOwner);
-        if (recreated.isEmpty()) {
-            BotLog.warn(io.github.zoyluo.aibot.log.LogCategory.LIFECYCLE, null,
-                    "bot_respawn_recreate_failed", "name", botName,
-                    "pos", LogFields.pos(BlockPos.ofFloored(respawnPos)));
-            return false;
-        }
-        AIPlayerEntity fresh = recreated.get();
-        if (previousRole != null && !previousRole.isBlank()) {
-            roles.put(fresh.getUuid(), normalizeRole(previousRole));
-        }
-        BotLog.danger(fresh, "bot_respawned_after_death",
-                "pos", LogFields.pos(fresh.getBlockPos()),
-                "strategy", respawnStrategy + "_recreated");
+        BotLog.danger(bot, "bot_respawned_after_death",
+                "pos", LogFields.pos(bot.getBlockPos()),
+                "strategy", respawnStrategy,
+                "client_revive_sent", true);
         return true;
     }
 
