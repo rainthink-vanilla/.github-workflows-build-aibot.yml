@@ -83,15 +83,43 @@ public final class AIPlayerManager {
                     bot.getGameProfile().getName());
             respawnStrategy = "strict_world_spawn";
         }
-        bot.setHealth(20.0F);
-        bot.deathTime = 0;
-        bot.getHungerManager().setFoodLevel(20);
-        bot.teleport(respawnWorld, respawnPos.x, respawnPos.y, respawnPos.z,
-                Collections.emptySet(), bot.getYaw(), bot.getPitch(), true);
-        bot.extinguish();
-        BotLog.danger(bot, "bot_respawned_after_death",
-                "pos", LogFields.pos(bot.getBlockPos()),
-                "strategy", respawnStrategy);
+        // ===== FIX 2026-10-25：死亡后客户端动画抽搐 =====
+        // AIPlayerEntity 继承 ServerPlayerEntity，而玩家血量不会进数据追踪器：
+        // 死亡时客户端只收到 EntityStatusS2CPacket(3)，它把自己的 deathTime 顶到最大并一直躺在
+        // 死亡姿势里；复活时服务端只改了本地副本（setHealth(=20)/deathTime(=0)），
+        // 客户端收不到任何"血量恢复"的包 → 表现就是"已经复活、有血条能被伤害，但动画在抽搐"。
+        //
+        // 修法：不原地复活，改成「销毁旧实体 + 在新位置重新生成」。
+        // 客户端会收到 destroy 再收到 spawn，实体对象整个重建，动画状态自然归零
+        // （等价于手动 /aibot despawn + /aibot spawn，那条路已验证可用）。
+        final MinecraftServer respawnServer = bot.getServer();
+        final String botName = bot.getGameProfile().getName();
+        final String previousRole = role(bot);
+        final java.util.UUID previousOwner = botOwners.get(bot.getUuid());
+        final float previousYaw = bot.getYaw();
+        final float previousPitch = bot.getPitch();
+        final GameMode previousGameMode = bot.interactionManager.getGameMode();
+
+        if (!despawn(respawnServer, botName)) {
+            BotLog.warn(io.github.zoyluo.aibot.log.LogCategory.LIFECYCLE, null,
+                    "bot_respawn_despawn_failed", "name", botName);
+            return false;
+        }
+        java.util.Optional<AIPlayerEntity> recreated = spawn(respawnServer, botName, respawnWorld,
+                respawnPos, previousYaw, previousPitch, previousGameMode, previousOwner);
+        if (recreated.isEmpty()) {
+            BotLog.warn(io.github.zoyluo.aibot.log.LogCategory.LIFECYCLE, null,
+                    "bot_respawn_recreate_failed", "name", botName,
+                    "pos", LogFields.pos(BlockPos.ofFloored(respawnPos)));
+            return false;
+        }
+        AIPlayerEntity fresh = recreated.get();
+        if (previousRole != null && !previousRole.isBlank()) {
+            roles.put(fresh.getUuid(), normalizeRole(previousRole));
+        }
+        BotLog.danger(fresh, "bot_respawned_after_death",
+                "pos", LogFields.pos(fresh.getBlockPos()),
+                "strategy", respawnStrategy + "_recreated");
         return true;
     }
 
